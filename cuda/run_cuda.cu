@@ -8,9 +8,10 @@
 #include <algorithm>
 #include <type_traits>
 #include <cstdint>
+#include <cstdio>
 
 #include "utils_cuda.hpp"
-#include "benchmark_config.hpp"
+#include "../common/benchmark_config.hpp"
 #include "../common/math_utils.hpp"
 
 // Kernel prototypes from kernels_all.cu
@@ -1145,6 +1146,7 @@ int main() {
     CUDA_CHECK(cudaSetDevice(0));
     std::string device_name = cuda_device_name();
     const std::string csv_path = "results_cuda.csv";
+    std::remove(csv_path.c_str());
 
     auto run_float = [&](const std::string& name, size_t sz, bool want64, ResultRow& row) {
         bool correct = false;

@@ -30,9 +30,10 @@
 #include <numeric>
 #include <limits>
 #include <cstdint>
+#include <cstdio>
 
 // Project headers (provided by user in ../common)
-#include "benchmark_config.hpp"
+#include "../common/benchmark_config.hpp"
 #include "utils_opencl.hpp"   // device/context helpers, enqueue_timed(), round_up(), build_program_from_file()
 #include "math_utils.hpp"     // allclose(...), fill_random(...)
 #include "baseline_check.hpp" // optional CPU baselines; guard usage
@@ -1466,6 +1467,7 @@ try
 
     // 3) CSV path (header managed inside helper)
     const std::string csv_path = "results_opencl.csv";
+    std::remove(csv_path.c_str());
 
     // 4) Dispatch table per kernel name
     auto run_float = [&](const std::string &name, size_t sz, bool want64, ResultRow &row)
