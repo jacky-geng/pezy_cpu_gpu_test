@@ -1,31 +1,35 @@
 // =============================================================
 // math_utils.hpp
-// Random init and result comparison helpers.
+// Simple numeric utilities: random fill, comparison, etc.
 // =============================================================
 #pragma once
 #include <vector>
 #include <random>
 #include <cmath>
+#include <algorithm>
 
-template<typename T>
-inline void fill_random(std::vector<T>& v, T low, T high, uint32_t seed = 123)
-{
-    std::mt19937 rng(seed);
-    std::uniform_real_distribution<double> dist((double)low, (double)high);
-    for (auto& x : v) x = (T)dist(rng);
+// =============================================================
+// Fill vector with random values between [lo, hi]
+// =============================================================
+template <typename T>
+void fill_random(std::vector<T>& v, T lo, T hi) {
+    std::mt19937 rng(123);
+    std::uniform_real_distribution<double> dist((double)lo, (double)hi);
+    for (auto& x : v) x = static_cast<T>(dist(rng));
 }
 
-template<typename T>
-inline bool compare_results(const std::vector<T>& a,
-                            const std::vector<T>& b,
-                            double eps)
-{
+// =============================================================
+// Compare two arrays within tolerance
+// Equivalent to numpy.allclose()
+// =============================================================
+template <typename T>
+bool allclose(const std::vector<T>& a, const std::vector<T>& b,
+              double rtol = 1e-5, double atol = 1e-8) {
     if (a.size() != b.size()) return false;
     for (size_t i = 0; i < a.size(); ++i) {
-        double da = (double)a[i], db = (double)b[i];
-        double diff = std::fabs(da - db);
-        double denom = std::max(1.0, std::max(std::fabs(da), std::fabs(db)));
-        if (diff / denom > eps) return false;
+        double diff = std::abs((double)a[i] - (double)b[i]);
+        double tol = atol + rtol * std::abs((double)b[i]);
+        if (diff > tol) return false;
     }
     return true;
 }
