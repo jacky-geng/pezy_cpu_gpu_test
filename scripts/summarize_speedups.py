@@ -19,6 +19,8 @@ OUTPUT_FIELDS = [
 ]
 
 FLOAT_DTYPES = {"FP32", "FP64"}
+DEFAULT_INPUT = Path("csv/combined_core_results.csv")
+DEFAULT_OUTPUT = Path("csv/pezy_speedup_summary.csv")
 
 KERNEL_NAME_MAP = {
     "CUDA": {
@@ -144,6 +146,7 @@ def aggregate_runtimes(input_path: Path) -> List[Dict[str, str]]:
 
 
 def write_summary(rows: List[Dict[str, str]], output_path: Path) -> int:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=OUTPUT_FIELDS)
         writer.writeheader()
@@ -158,14 +161,14 @@ def main() -> None:
     parser.add_argument(
         "--input",
         type=Path,
-        default=Path("combined_core_results.csv"),
-        help="Path to the merged runtime CSV (default: combined_core_results.csv)",
+        default=DEFAULT_INPUT,
+        help=f"Path to the merged runtime CSV (default: {DEFAULT_INPUT})",
     )
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("pezy_speedup_summary.csv"),
-        help="Destination path for the summary CSV (default: pezy_speedup_summary.csv)",
+        default=DEFAULT_OUTPUT,
+        help=f"Destination path for the summary CSV (default: {DEFAULT_OUTPUT})",
     )
     args = parser.parse_args()
 

@@ -41,7 +41,7 @@ inline bool compare_results(const std::vector<T>& a, const std::vector<T>& b, do
 inline void write_csv_row_cuda(const std::string& path,
                                const std::string& kernel,
                                const std::string& dtype,
-                               size_t input_size,
+                               const std::string& input_size,
                                double runtime_ms,
                                bool correct,
                                const std::string& device_name,
@@ -51,8 +51,8 @@ inline void write_csv_row_cuda(const std::string& path,
                                double bw_GBps) {
     FILE* f = fopen(path.c_str(), "a");
     if (!f) return;
-    fprintf(f, "%s,%s,%zu,%.6f,%s,%s,%zu,%zu,%zu,%zu,%zu,%zu,%.6e,%.6f\n",
-            kernel.c_str(), dtype.c_str(), input_size, runtime_ms,
+    fprintf(f, "%s,%s,%s,%.6f,%s,%s,%zu,%zu,%zu,%zu,%zu,%zu,%.6e,%.6f\n",
+            kernel.c_str(), dtype.c_str(), input_size.c_str(), runtime_ms,
             correct ? "true" : "false", device_name.c_str(),
             g0, g1, g2, l0, l1, l2, flops_est, bw_GBps);
     fclose(f);

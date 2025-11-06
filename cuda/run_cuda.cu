@@ -9,10 +9,12 @@
 #include <type_traits>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 
 #include "utils_cuda.hpp"
 #include "../common/benchmark_config.hpp"
 #include "../common/math_utils.hpp"
+#include "../common/sequence_configs.hpp"
 
 // Kernel prototypes from kernels_all.cu
 extern "C" __global__ void vecadd_f32(const float*, const float*, float*, int);
@@ -72,6 +74,9 @@ extern "C" __global__ void fft1d_global_f32(float2*, int, int);
 extern "C" __global__ void fft1d_global_f64(double2*, int, int);
 extern "C" __global__ void fft1d_staged_f32(float2*, int, int);
 extern "C" __global__ void fft1d_staged_f64(double2*, int, int);
+extern "C" __global__ void smithwaterman_basic_kernel(const uint8_t*, const uint8_t*, int*, int, int, int, int, int);
+extern "C" __global__ void smithwaterman_wavefront_kernel(const uint8_t*, const uint8_t*, int*, int, int, int, int, int);
+extern "C" __global__ void wfa_editdistance_kernel(const uint8_t*, const uint8_t*, int*, int, int);
 
 struct RunInfo {
     size_t g0 = 0, g1 = 1, g2 = 1;
@@ -121,6 +126,94 @@ T cpu_dot(const std::vector<T>& a, const std::vector<T>& b) {
     T acc = T(0);
     for (size_t i = 0; i < a.size(); ++i) acc += a[i] * b[i];
     return acc;
+}
+
+static void fill_random_bases(std::vector<uint8_t>& data) {
+    auto& rng = global_rng();
+    std::uniform_int_distribution<int> dist(0, 3);
+    for (auto& v : data)
+        v = static_cast<uint8_t>(dist(rng));
+}
+
+static int cpu_smithwaterman_pair(const uint8_t* a,
+                                  const uint8_t* b,
+                                  int len,
+                                  int match_score,
+                                  int mismatch_score,
+                                  int gap_score) {
+    std::vector<int> prev(len + 1, 0), curr(len + 1, 0);
+    int best = 0;
+    for (int i = 1; i <= len; ++i) {
+        curr[0] = 0;
+        for (int j = 1; j <= len; ++j) {
+            int diag = prev[j - 1] + (a[i - 1] == b[j - 1] ? match_score : mismatch_score);
+            int up = prev[j] + gap_score;
+            int left = curr[j - 1] + gap_score;
+            int val = std::max({0, diag, up, left});
+            curr[j] = val;
+            best = std::max(best, val);
+        }
+        std::swap(prev, curr);
+    }
+    return best;
+}
+
+static int cpu_edit_distance_pair(const uint8_t* a,
+                                  const uint8_t* b,
+                                  int len) {
+    std::vector<int> prev(len + 1);
+    std::vector<int> curr(len + 1);
+    for (int j = 0; j <= len; ++j) prev[j] = j;
+    for (int i = 1; i <= len; ++i) {
+        curr[0] = i;
+        for (int j = 1; j <= len; ++j) {
+            int cost = (a[i - 1] == b[j - 1]) ? 0 : 1;
+            curr[j] = std::min({prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost});
+        }
+        std::swap(prev, curr);
+    }
+    return prev[len];
+}
+
+struct SmithWatermanDataset {
+    std::vector<uint8_t> seqA;
+    std::vector<uint8_t> seqB;
+    std::vector<int> reference;
+    size_t verify_pairs = 0;
+};
+
+static SmithWatermanDataset build_smithwaterman_dataset(size_t num_pairs,
+                                                        int len,
+                                                        int match_score,
+                                                        int mismatch_score,
+                                                        int gap_score) {
+    SmithWatermanDataset data;
+    size_t total_elems = num_pairs * static_cast<size_t>(len);
+    data.seqA.resize(total_elems);
+    data.seqB.resize(total_elems);
+    fill_random_bases(data.seqA);
+    fill_random_bases(data.seqB);
+    data.reference.resize(num_pairs);
+    data.verify_pairs = std::min<size_t>(num_pairs, 2048);
+    for (size_t p = 0; p < data.verify_pairs; ++p) {
+        const uint8_t* a = data.seqA.data() + p * len;
+        const uint8_t* b = data.seqB.data() + p * len;
+        data.reference[p] = cpu_smithwaterman_pair(a, b, len, match_score, mismatch_score, gap_score);
+    }
+    for (size_t p = data.verify_pairs; p < num_pairs; ++p)
+        data.reference[p] = std::numeric_limits<int>::min();
+    return data;
+}
+
+static std::string size_label_for(const std::string& kernel_name, size_t sz) {
+    if (kernel_name == "smithwaterman_basic" || kernel_name == "smithwaterman_wavefront") {
+        const auto& sizes = smithwaterman_problem_sizes();
+        if (sz < sizes.size()) return sizes[sz].label;
+    } else if (kernel_name == "wfa_editdistance") {
+        const auto& sizes = wfa_problem_sizes();
+        if (sz < sizes.size()) return sizes[sz].label;
+    }
+    return std::to_string(sz);
 }
 
 template <typename T>
@@ -782,6 +875,170 @@ double run_montecarlo(size_t N, bool use_fp64, bool& correct, RunInfo& info) {
     return ms;
 }
 
+double run_smithwaterman(size_t config_idx, bool& correct, RunInfo& info) {
+    const auto& spec = smithwaterman_problem_sizes().at(config_idx);
+    const size_t num_pairs = spec.num_pairs;
+    const int seq_len = static_cast<int>(spec.sequence_length);
+    const int match_score = 2;
+    const int mismatch_score = -1;
+    const int gap_score = -2;
+
+    SmithWatermanDataset data = build_smithwaterman_dataset(num_pairs, seq_len, match_score, mismatch_score, gap_score);
+    const size_t total_elems = data.seqA.size();
+    uint8_t *dA, *dB;
+    int *dOut;
+    CUDA_CHECK(cudaMalloc(&dA, total_elems * sizeof(uint8_t)));
+    CUDA_CHECK(cudaMalloc(&dB, total_elems * sizeof(uint8_t)));
+    CUDA_CHECK(cudaMalloc(&dOut, num_pairs * sizeof(int)));
+    CUDA_CHECK(cudaMemcpy(dA, data.seqA.data(), total_elems * sizeof(uint8_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dB, data.seqB.data(), total_elems * sizeof(uint8_t), cudaMemcpyHostToDevice));
+
+    dim3 block(256);
+    dim3 grid((static_cast<unsigned int>(num_pairs) + block.x - 1) / block.x);
+    CudaTimer timer; timer.begin();
+    smithwaterman_basic_kernel<<<grid, block>>>(
+        dA, dB, dOut,
+        static_cast<int>(num_pairs),
+        seq_len,
+        match_score,
+        mismatch_score,
+        gap_score);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    double ms = timer.end();
+
+    std::vector<int> gpu(num_pairs);
+    CUDA_CHECK(cudaMemcpy(gpu.data(), dOut, num_pairs * sizeof(int), cudaMemcpyDeviceToHost));
+    bool ok = true;
+    for (size_t i = 0; i < data.verify_pairs; ++i) {
+        if (gpu[i] != data.reference[i]) { ok = false; break; }
+    }
+    correct = ok;
+
+    info.g0 = grid.x * block.x; info.l0 = block.x;
+    info.flops_est = static_cast<double>(num_pairs) * seq_len * seq_len * 6.0;
+    info.bytes_moved = static_cast<double>(num_pairs) *
+                       (2.0 * seq_len * sizeof(uint8_t) + sizeof(int));
+    info.bw_GBps = info.bytes_moved / (ms * 1e6);
+
+    CUDA_CHECK(cudaFree(dA));
+    CUDA_CHECK(cudaFree(dB));
+    CUDA_CHECK(cudaFree(dOut));
+    return ms;
+}
+
+double run_smithwaterman_wavefront(size_t config_idx, bool& correct, RunInfo& info) {
+    const auto& spec = smithwaterman_problem_sizes().at(config_idx);
+    const size_t num_pairs = spec.num_pairs;
+    const int seq_len = static_cast<int>(spec.sequence_length);
+    const int match_score = 2;
+    const int mismatch_score = -1;
+    const int gap_score = -2;
+
+    SmithWatermanDataset data = build_smithwaterman_dataset(num_pairs, seq_len, match_score, mismatch_score, gap_score);
+    const size_t total_elems = data.seqA.size();
+
+    uint8_t *dA, *dB;
+    int *dOut;
+    CUDA_CHECK(cudaMalloc(&dA, total_elems * sizeof(uint8_t)));
+    CUDA_CHECK(cudaMalloc(&dB, total_elems * sizeof(uint8_t)));
+    CUDA_CHECK(cudaMalloc(&dOut, num_pairs * sizeof(int)));
+    CUDA_CHECK(cudaMemcpy(dA, data.seqA.data(), total_elems * sizeof(uint8_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dB, data.seqB.data(), total_elems * sizeof(uint8_t), cudaMemcpyHostToDevice));
+
+    unsigned int block_size = 1;
+    while (block_size < static_cast<unsigned int>(seq_len) && block_size < 1024u) block_size <<= 1;
+    if (block_size > 1024u) block_size = 1024u;
+    dim3 block(block_size);
+    dim3 grid(static_cast<unsigned int>(num_pairs));
+    size_t shared_bytes = sizeof(int) * (3 * (seq_len + 1) + block.x);
+
+    CudaTimer timer; timer.begin();
+    smithwaterman_wavefront_kernel<<<grid, block, shared_bytes>>>(
+        dA, dB, dOut,
+        static_cast<int>(num_pairs),
+        seq_len,
+        match_score,
+        mismatch_score,
+        gap_score);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    double ms = timer.end();
+
+    std::vector<int> gpu(num_pairs);
+    CUDA_CHECK(cudaMemcpy(gpu.data(), dOut, num_pairs * sizeof(int), cudaMemcpyDeviceToHost));
+    bool ok = true;
+    for (size_t i = 0; i < data.verify_pairs; ++i) {
+        if (gpu[i] != data.reference[i]) { ok = false; break; }
+    }
+    correct = ok;
+
+    info.g0 = grid.x * block.x; info.l0 = block.x;
+    info.flops_est = static_cast<double>(num_pairs) * seq_len * seq_len * 6.0;
+    info.bytes_moved = static_cast<double>(num_pairs) *
+                       (2.0 * seq_len * sizeof(uint8_t) + sizeof(int));
+    info.bw_GBps = info.bytes_moved / (ms * 1e6);
+
+    CUDA_CHECK(cudaFree(dA));
+    CUDA_CHECK(cudaFree(dB));
+    CUDA_CHECK(cudaFree(dOut));
+    return ms;
+}
+
+double run_wfa(size_t config_idx, bool& correct, RunInfo& info) {
+    const auto& spec = wfa_problem_sizes().at(config_idx);
+    const size_t num_pairs = spec.num_pairs;
+    const int seq_len = static_cast<int>(spec.sequence_length);
+    size_t total_elems = num_pairs * static_cast<size_t>(seq_len);
+    std::vector<uint8_t> seqA(total_elems);
+    std::vector<uint8_t> seqB(total_elems);
+    fill_random_bases(seqA);
+    fill_random_bases(seqB);
+
+    std::vector<int> ref(num_pairs, std::numeric_limits<int>::min());
+    size_t verify_pairs = std::min<size_t>(num_pairs, 2048);
+    for (size_t p = 0; p < verify_pairs; ++p) {
+        const uint8_t* a = seqA.data() + p * seq_len;
+        const uint8_t* b = seqB.data() + p * seq_len;
+        ref[p] = cpu_edit_distance_pair(a, b, seq_len);
+    }
+
+    uint8_t *dA, *dB;
+    int *dOut;
+    CUDA_CHECK(cudaMalloc(&dA, total_elems * sizeof(uint8_t)));
+    CUDA_CHECK(cudaMalloc(&dB, total_elems * sizeof(uint8_t)));
+    CUDA_CHECK(cudaMalloc(&dOut, num_pairs * sizeof(int)));
+    CUDA_CHECK(cudaMemcpy(dA, seqA.data(), total_elems * sizeof(uint8_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dB, seqB.data(), total_elems * sizeof(uint8_t), cudaMemcpyHostToDevice));
+
+    dim3 block(256);
+    dim3 grid((static_cast<unsigned int>(num_pairs) + block.x - 1) / block.x);
+    CudaTimer timer; timer.begin();
+    wfa_editdistance_kernel<<<grid, block>>>(
+        dA, dB, dOut,
+        static_cast<int>(num_pairs),
+        seq_len);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    double ms = timer.end();
+
+    std::vector<int> gpu(num_pairs);
+    CUDA_CHECK(cudaMemcpy(gpu.data(), dOut, num_pairs * sizeof(int), cudaMemcpyDeviceToHost));
+    bool ok = true;
+    for (size_t i = 0; i < verify_pairs; ++i) {
+        if (gpu[i] != ref[i]) { ok = false; break; }
+    }
+    correct = ok;
+
+    info.g0 = grid.x * block.x; info.l0 = block.x;
+    info.flops_est = static_cast<double>(num_pairs) * seq_len * seq_len * 4.0;
+    info.bytes_moved = static_cast<double>(num_pairs) *
+                       (2.0 * seq_len * sizeof(uint8_t) + sizeof(int));
+    info.bw_GBps = info.bytes_moved / (ms * 1e6);
+
+    CUDA_CHECK(cudaFree(dA));
+    CUDA_CHECK(cudaFree(dB));
+    CUDA_CHECK(cudaFree(dOut));
+    return ms;
+}
+
 template <typename Complex>
 std::vector<Complex> cpu_dft(const std::vector<Complex>& in) {
     size_t N = in.size();
@@ -1136,7 +1393,7 @@ double run_activation(const std::string& name, size_t N, bool& correct, RunInfo&
 struct ResultRow {
     std::string kernel;
     std::string dtype;
-    size_t size;
+    std::string size_label;
     double ms;
     bool correct;
     RunInfo info;
@@ -1145,7 +1402,7 @@ struct ResultRow {
 int main() {
     CUDA_CHECK(cudaSetDevice(0));
     std::string device_name = cuda_device_name();
-    const std::string csv_path = "results_cuda.csv";
+    const std::string csv_path = "../csv/results_cuda.csv";
     std::remove(csv_path.c_str());
 
     auto run_float = [&](const std::string& name, size_t sz, bool want64, ResultRow& row) {
@@ -1228,6 +1485,12 @@ int main() {
             ms = run_histogram(name, sz, correct, info);
         else if (name == "sort_bitonic")
             ms = run_sort_bitonic(sz, correct, info);
+        else if (name == "smithwaterman_basic")
+            ms = run_smithwaterman(sz, correct, info);
+        else if (name == "smithwaterman_wavefront")
+            ms = run_smithwaterman_wavefront(sz, correct, info);
+        else if (name == "wfa_editdistance")
+            ms = run_wfa(sz, correct, info);
         else {
             std::cout << "[CUDA] Warning: integer kernel " << name << " not implemented.\n";
             correct = false; info = {}; ms = 0.0;
@@ -1246,28 +1509,37 @@ int main() {
         if (!bench.enabled) continue;
         for (size_t sz : bench.sizes) {
             if (bench.dtype_mode == DTypeMode::FLOATING) {
-                ResultRow row32{bench.name, "FP32", sz};
+                ResultRow row32;
+                row32.kernel = bench.name;
+                row32.dtype = "FP32";
+                row32.size_label = size_label_for(bench.name, sz);
                 std::cout << "[CUDA] Running kernel=" << bench.name << " dtype=FP32 size=" << sz << std::endl;
                 run_float(bench.name, sz, false, row32);
-                write_csv_row_cuda(csv_path, row32.kernel, row32.dtype, row32.size,
+                write_csv_row_cuda(csv_path, row32.kernel, row32.dtype, row32.size_label,
                                    row32.ms, row32.correct, device_name,
                                    row32.info.g0, row32.info.g1, row32.info.g2,
                                    row32.info.l0, row32.info.l1, row32.info.l2,
                                    row32.info.flops_est, row32.info.bw_GBps);
 
-                ResultRow row64{bench.name, "FP64", sz};
+                ResultRow row64;
+                row64.kernel = bench.name;
+                row64.dtype = "FP64";
+                row64.size_label = size_label_for(bench.name, sz);
                 std::cout << "[CUDA] Running kernel=" << bench.name << " dtype=FP64 size=" << sz << std::endl;
                 run_float(bench.name, sz, true, row64);
-                write_csv_row_cuda(csv_path, row64.kernel, row64.dtype, row64.size,
+                write_csv_row_cuda(csv_path, row64.kernel, row64.dtype, row64.size_label,
                                    row64.ms, row64.correct, device_name,
                                    row64.info.g0, row64.info.g1, row64.info.g2,
                                    row64.info.l0, row64.info.l1, row64.info.l2,
                                    row64.info.flops_est, row64.info.bw_GBps);
             } else {
-                ResultRow rowi{bench.name, "INT32", sz};
+                ResultRow rowi;
+                rowi.kernel = bench.name;
+                rowi.dtype = "INT32";
+                rowi.size_label = size_label_for(bench.name, sz);
                 std::cout << "[CUDA] Running kernel=" << bench.name << " dtype=INT32 size=" << sz << std::endl;
                 run_integer(bench.name, sz, rowi);
-                write_csv_row_cuda(csv_path, rowi.kernel, rowi.dtype, rowi.size,
+                write_csv_row_cuda(csv_path, rowi.kernel, rowi.dtype, rowi.size_label,
                                    rowi.ms, rowi.correct, device_name,
                                    rowi.info.g0, rowi.info.g1, rowi.info.g2,
                                    rowi.info.l0, rowi.info.l1, rowi.info.l2,

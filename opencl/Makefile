@@ -11,10 +11,15 @@ LDFLAGS  := -lOpenCL
 SRC := run_opencl.cpp
 BIN := run_opencl
 
+.PHONY: all run clean
+
 all: $(BIN)
 
 $(BIN): $(SRC) utils_opencl.hpp ../common/benchmark_config.hpp ../common/csv_writer.hpp ../common/math_utils.hpp ../common/baseline_check.hpp
 	$(CXX) $(CXXFLAGS) -o $@ $(SRC) $(LDFLAGS)
+
+run: $(BIN)
+	./$(BIN)
 
 clean:
 	rm -f $(BIN)

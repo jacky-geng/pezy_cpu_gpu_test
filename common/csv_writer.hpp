@@ -14,7 +14,7 @@ inline bool file_exists(const std::string& path) {
 inline void write_csv_row(const std::string& path,
                           const std::string& kernel,
                           const std::string& dtype,
-                          size_t input_size,
+                          const std::string& input_size,
                           double runtime_ms,
                           bool correct,
                           const std::string& device,

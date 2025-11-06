@@ -1038,3 +1038,193 @@ void fft1d_staged_f64(double2* data, int N, int mh) {
     if (tid >= N / 2) return;
     fft1d_stage<double,double2>(data, N, tid, mh);
 }
+
+// ---------------- Sequence Alignment (Smith-Waterman + WFA) ----------------
+extern "C" __global__
+void smithwaterman_basic_kernel(const uint8_t* seqA,
+                                const uint8_t* seqB,
+                                int* scores,
+                                int num_pairs,
+                                int len,
+                                int match_score,
+                                int mismatch_score,
+                                int gap_score) {
+    const int SW_MAX_LEN = 256;
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_pairs) return;
+
+    if (len > SW_MAX_LEN) len = SW_MAX_LEN;
+    const uint8_t* a = seqA + static_cast<size_t>(tid) * len;
+    const uint8_t* b = seqB + static_cast<size_t>(tid) * len;
+    int prev[SW_MAX_LEN + 1];
+    int curr[SW_MAX_LEN + 1];
+    for (int j = 0; j <= len; ++j) prev[j] = 0;
+    int best = 0;
+    for (int i = 1; i <= len; ++i) {
+        curr[0] = 0;
+        uint8_t ai = a[i - 1];
+        for (int j = 1; j <= len; ++j) {
+            int diag = prev[j - 1] + (ai == b[j - 1] ? match_score : mismatch_score);
+            int up   = prev[j] + gap_score;
+            int left = curr[j - 1] + gap_score;
+            int val = diag;
+            if (up > val) val = up;
+            if (left > val) val = left;
+            if (val < 0) val = 0;
+            curr[j] = val;
+            if (val > best) best = val;
+        }
+        for (int j = 0; j <= len; ++j)
+            prev[j] = curr[j];
+    }
+    scores[tid] = best;
+}
+
+extern "C" __global__
+void wfa_editdistance_kernel(const uint8_t* seqA,
+                             const uint8_t* seqB,
+                             int* distances,
+                             int num_pairs,
+                             int len) {
+    const int WFA_MAX_LEN = 256;
+    const int DIAG_COUNT = 2 * WFA_MAX_LEN + 1;
+    const int NEG_INF = -1000000;
+
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_pairs) return;
+    if (len > WFA_MAX_LEN) len = WFA_MAX_LEN;
+
+    const uint8_t* a = seqA + static_cast<size_t>(tid) * len;
+    const uint8_t* b = seqB + static_cast<size_t>(tid) * len;
+
+    int prev[DIAG_COUNT];
+    int curr[DIAG_COUNT];
+    for (int i = 0; i < DIAG_COUNT; ++i) {
+        prev[i] = NEG_INF;
+        curr[i] = NEG_INF;
+    }
+
+    const int center = WFA_MAX_LEN;
+    int offset = 0;
+    while (offset < len && a[offset] == b[offset]) ++offset;
+    if (offset >= len) {
+        distances[tid] = 0;
+        return;
+    }
+    prev[center] = offset;
+
+    const int max_dist = len * 2;
+    for (int dist = 1; dist <= max_dist; ++dist) {
+        int diag_min = -dist;
+        int diag_max = dist;
+        for (int diag = diag_min; diag <= diag_max; ++diag) {
+            int idx = center + diag;
+            int best = NEG_INF;
+            if (idx - 1 >= 0) {
+                int cand = prev[idx - 1] + 1; // insertion
+                if (cand > best) best = cand;
+            }
+            if (idx >= 0 && idx < DIAG_COUNT) {
+                int cand = prev[idx] + 1; // mismatch
+                if (cand > best) best = cand;
+            }
+            if (idx + 1 < DIAG_COUNT) {
+                int cand = prev[idx + 1]; // deletion
+                if (cand > best) best = cand;
+            }
+            if (best < 0) best = 0;
+            int i = best;
+            int j = i - diag;
+            while (i < len && j < len && j >= 0 && a[i] == b[j]) {
+                ++i;
+                ++j;
+            }
+            curr[idx] = i;
+            if (i >= len && j >= len) {
+                distances[tid] = dist;
+                return;
+            }
+        }
+        for (int diag = diag_min; diag <= diag_max; ++diag) {
+            int idx = center + diag;
+            prev[idx] = curr[idx];
+            curr[idx] = NEG_INF;
+        }
+    }
+    distances[tid] = len;
+}
+
+extern "C" __global__
+void smithwaterman_wavefront_kernel(const uint8_t* seqA,
+                                    const uint8_t* seqB,
+                                    int* scores,
+                                    int num_pairs,
+                                    int len,
+                                    int match_score,
+                                    int mismatch_score,
+                                    int gap_score) {
+    const int SW_MAX_LEN = 256;
+    int pair = blockIdx.x;
+    if (pair >= num_pairs) return;
+
+    int effective_len = len > SW_MAX_LEN ? SW_MAX_LEN : len;
+    const uint8_t* a = seqA + static_cast<size_t>(pair) * len;
+    const uint8_t* b = seqB + static_cast<size_t>(pair) * len;
+
+    extern __shared__ int shared[];
+    int* diag_prev2 = shared;
+    int* diag_prev  = diag_prev2 + (effective_len + 1);
+    int* diag_curr  = diag_prev  + (effective_len + 1);
+    int* best_buf   = diag_curr  + (effective_len + 1);
+
+    for (int idx = threadIdx.x; idx <= effective_len; idx += blockDim.x) {
+        diag_prev2[idx] = 0;
+        diag_prev[idx] = 0;
+        diag_curr[idx] = 0;
+    }
+    if (threadIdx.x < blockDim.x) best_buf[threadIdx.x] = 0;
+    __syncthreads();
+
+    int best_local = 0;
+    int max_diag = 2 * effective_len;
+    for (int diag = 1; diag <= max_diag; ++diag) {
+        __syncthreads();
+        int i_start = max(1, diag - effective_len);
+        int i_end = min(effective_len, diag);
+
+        int i = i_start + threadIdx.x;
+        if (i <= i_end) {
+            int j = diag - i;
+            if (j >= 1 && j <= effective_len) {
+                int diag_val = diag_prev2[i - 1];
+                int up_val = diag_prev[i - 1];
+                int left_val = diag_prev[i];
+                int score = diag_val + (a[i - 1] == b[j - 1] ? match_score : mismatch_score);
+                score = max(score, up_val + gap_score);
+                score = max(score, left_val + gap_score);
+                if (score < 0) score = 0;
+                diag_curr[i] = score;
+                best_local = max(best_local, score);
+            } else {
+                diag_curr[i] = 0;
+            }
+        }
+        __syncthreads();
+        for (int idx = threadIdx.x; idx <= effective_len; idx += blockDim.x) {
+            diag_prev2[idx] = diag_prev[idx];
+            diag_prev[idx] = diag_curr[idx];
+            diag_curr[idx] = 0;
+        }
+        __syncthreads();
+    }
+
+    best_buf[threadIdx.x] = best_local;
+    __syncthreads();
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride)
+            best_buf[threadIdx.x] = max(best_buf[threadIdx.x], best_buf[threadIdx.x + stride]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0)
+        scores[pair] = best_buf[0];
+}

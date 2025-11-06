@@ -10,6 +10,8 @@ from typing import Dict, Iterable, List
 
 
 CORE_COLUMNS = ["kernel_name", "dtype", "input_size", "runtime", "correct", "device_name"]
+DEFAULT_INPUT_DIR = Path("csv")
+DEFAULT_OUTPUT_PATH = DEFAULT_INPUT_DIR / "combined_core_results.csv"
 
 
 def normalize_correct(value: str | None) -> str:
@@ -27,9 +29,7 @@ def load_cuda(path: Path) -> Iterable[Dict[str, str]]:
     with path.open(newline="") as handle:
         reader = csv.reader(handle)
         for row in reader:
-            if not row:
-                continue
-            if len(row) < 6:
+            if not row or len(row) < 6:
                 continue
             yield {
                 "kernel_name": row[0].strip(),
@@ -94,6 +94,7 @@ def merge_results(input_dir: Path, output_path: Path) -> int:
         loader = select_loader(csv_path)
         rows.extend(loader(csv_path))
 
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=CORE_COLUMNS)
         writer.writeheader()
@@ -107,14 +108,14 @@ def main() -> None:
     parser.add_argument(
         "--input-dir",
         type=Path,
-        default=Path("csv"),
-        help="Directory containing the CSV inputs (default: ./csv)",
+        default=DEFAULT_INPUT_DIR,
+        help=f"Directory containing the CSV inputs (default: {DEFAULT_INPUT_DIR})",
     )
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("combined_core_results.csv"),
-        help="Path for the merged CSV (default: ./combined_core_results.csv)",
+        default=DEFAULT_OUTPUT_PATH,
+        help=f"Path for the merged CSV (default: {DEFAULT_OUTPUT_PATH})",
     )
     args = parser.parse_args()
 

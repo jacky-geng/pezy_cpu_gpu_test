@@ -2,6 +2,16 @@
 #include <string>
 #include <vector>
 
+#include "sequence_configs.hpp"
+
+// Sequence sweep indices used below:
+//   0 -> pairs1024_len128
+//   1 -> pairs2048_len256
+//   2 -> pairs4096_len256
+//   3 -> pairs8192_len256
+//   4 -> pairs16384_len256
+//   5 -> pairs32768_len256
+
 enum class DTypeMode
 {
     FLOATING,
@@ -55,5 +65,10 @@ static const std::vector<BenchConfig> BENCHMARKS = {
     {"sort_bitonic",     {1 << 8, 1 << 10},         DTypeMode::INTEGER,  true},
     {"montecarlo_basic", {1 << 10, 1 << 12},        DTypeMode::FLOATING, true},
     {"fft1d_global",     {1 << 8, 1 << 10, 1 << 12}, DTypeMode::FLOATING, true},
-    {"fft1d_staged",     {1 << 8, 1 << 10, 1 << 12}, DTypeMode::FLOATING, true}
+    {"fft1d_staged",     {1 << 8, 1 << 10, 1 << 12}, DTypeMode::FLOATING, true},
+
+    // 5. Sequence Alignment
+    {"smithwaterman_basic",     {0, 1, 2, 3, 4, 5}, DTypeMode::INTEGER, true},
+    {"smithwaterman_wavefront", {0, 1, 2, 3, 4, 5}, DTypeMode::INTEGER, true},
+    {"wfa_editdistance",        {0, 1, 2, 3, 4, 5}, DTypeMode::INTEGER, true}
 };

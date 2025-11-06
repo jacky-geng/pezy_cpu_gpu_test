@@ -39,6 +39,7 @@
 #include "baseline_check.hpp" // optional CPU baselines; guard usage
 #include "csv_writer.hpp"     // simple CSV dump
 #include "timer.hpp"          // host-side timing helper
+#include "../common/sequence_configs.hpp"
 
 using std::cerr;
 using std::cout;
@@ -89,6 +90,105 @@ static void fill_uniform(std::vector<T> &v, T lo, T hi, uint64_t seed = 42)
         for (auto &x : v)
             x = static_cast<T>(dist(rng));
     }
+}
+
+static std::string size_label_for(const std::string &kernel_name, size_t idx)
+{
+    if (kernel_name == "smithwaterman_basic" || kernel_name == "smithwaterman_wavefront")
+    {
+        const auto &sizes = smithwaterman_problem_sizes();
+        if (idx < sizes.size())
+            return sizes[idx].label;
+    }
+    else if (kernel_name == "wfa_editdistance")
+    {
+        const auto &sizes = wfa_problem_sizes();
+        if (idx < sizes.size())
+            return sizes[idx].label;
+    }
+    return std::to_string(idx);
+}
+
+static void fill_random_bases(std::vector<uint8_t> &v, uint64_t seed = 42)
+{
+    std::mt19937_64 rng(seed);
+    std::uniform_int_distribution<int> dist(0, 3);
+    for (auto &x : v)
+        x = static_cast<uint8_t>(dist(rng));
+}
+
+static int cpu_smithwaterman_pair(const uint8_t *a,
+                                  const uint8_t *b,
+                                  int len,
+                                  int match_score,
+                                  int mismatch_score,
+                                  int gap_score)
+{
+    std::vector<int> prev(len + 1, 0), curr(len + 1, 0);
+    int best = 0;
+    for (int i = 1; i <= len; ++i)
+    {
+        curr[0] = 0;
+        for (int j = 1; j <= len; ++j)
+        {
+            int diag = prev[j - 1] + (a[i - 1] == b[j - 1] ? match_score : mismatch_score);
+            int up = prev[j] + gap_score;
+            int left = curr[j - 1] + gap_score;
+            int val = std::max({0, diag, up, left});
+            curr[j] = val;
+            best = std::max(best, val);
+        }
+        std::swap(prev, curr);
+    }
+    return best;
+}
+
+static int cpu_edit_distance_pair(const uint8_t *a,
+                                  const uint8_t *b,
+                                  int len)
+{
+    std::vector<int> prev(len + 1);
+    std::vector<int> curr(len + 1);
+    for (int j = 0; j <= len; ++j)
+        prev[j] = j;
+    for (int i = 1; i <= len; ++i)
+    {
+        curr[0] = i;
+        for (int j = 1; j <= len; ++j)
+        {
+            int cost = (a[i - 1] == b[j - 1]) ? 0 : 1;
+            curr[j] = std::min({prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost});
+        }
+        std::swap(prev, curr);
+    }
+    return prev[len];
+}
+
+static void prepare_smithwaterman_data(size_t num_pairs,
+                                       int len,
+                                       int match_score,
+                                       int mismatch_score,
+                                       int gap_score,
+                                       std::vector<uint8_t> &seqA,
+                                       std::vector<uint8_t> &seqB,
+                                       std::vector<int> &reference,
+                                       size_t &verify_pairs)
+{
+    size_t total = num_pairs * static_cast<size_t>(len);
+    seqA.resize(total);
+    seqB.resize(total);
+    fill_random_bases(seqA, 171);
+    fill_random_bases(seqB, 341);
+    reference.resize(num_pairs);
+    verify_pairs = std::min<size_t>(num_pairs, 2048);
+    for (size_t p = 0; p < verify_pairs; ++p)
+    {
+        const uint8_t *a = seqA.data() + p * len;
+        const uint8_t *b = seqB.data() + p * len;
+        reference[p] = cpu_smithwaterman_pair(a, b, len, match_score, mismatch_score, gap_score);
+    }
+    for (size_t p = verify_pairs; p < num_pairs; ++p)
+        reference[p] = std::numeric_limits<int>::min();
 }
 
 // local allclose (namespaced) to avoid collision; fallback if math_utils.hpp not found
@@ -1341,6 +1441,191 @@ static double run_montecarlo(cl::Context &ctx, cl::CommandQueue &q, cl::Program 
     set_runinfo_1d(info, gws, lws);
     info.flops_est = double(4 * N);
     info.bytes_moved = sizeof(T) * (2 * N) + sizeof(uint32_t) * gws;
+   finalize_bandwidth(info, ms);
+   return ms;
+}
+
+static double run_smithwaterman(cl::Context &ctx, cl::CommandQueue &q, cl::Program &prog,
+                                const string &base, size_t config_idx,
+                                bool &correct, RunInfo &info)
+{
+    string kname = base;
+    cl::Kernel krn(prog, kname.c_str());
+
+    const auto &spec = smithwaterman_problem_sizes().at(config_idx);
+    const size_t num_pairs = spec.num_pairs;
+    const int seq_len = static_cast<int>(spec.sequence_length);
+    const int match_score = 2;
+    const int mismatch_score = -1;
+    const int gap_score = -2;
+
+    std::vector<uint8_t> seqA;
+    std::vector<uint8_t> seqB;
+    std::vector<int> ref;
+    size_t verify_pairs = 0;
+    prepare_smithwaterman_data(num_pairs, seq_len, match_score, mismatch_score, gap_score, seqA, seqB, ref, verify_pairs);
+
+    cl::Buffer dA = make_read_buf(ctx, seqA);
+    cl::Buffer dB = make_read_buf(ctx, seqB);
+    cl::Buffer dOut = make_write_buf<int>(ctx, num_pairs);
+
+    krn.setArg(0, dA);
+    krn.setArg(1, dB);
+    krn.setArg(2, dOut);
+    krn.setArg(3, (int)num_pairs);
+    krn.setArg(4, seq_len);
+    krn.setArg(5, match_score);
+    krn.setArg(6, mismatch_score);
+    krn.setArg(7, gap_score);
+
+    size_t lws = 128;
+    size_t gws = round_up(num_pairs, lws);
+    cl::Event evt;
+    q.enqueueNDRangeKernel(krn, cl::NullRange, cl::NDRange(gws), cl::NDRange(lws), nullptr, &evt);
+    evt.wait();
+    double ms = event_elapsed_ms(evt);
+
+    std::vector<int> gpu(num_pairs);
+    read_back(q, dOut, gpu);
+    bool ok = true;
+    for (size_t i = 0; i < verify_pairs; ++i)
+    {
+        if (gpu[i] != ref[i])
+        {
+            ok = false;
+            break;
+        }
+    }
+    correct = ok;
+
+    set_runinfo_1d(info, gws, lws);
+    info.flops_est = double(num_pairs) * seq_len * seq_len * 6.0;
+    info.bytes_moved = double(num_pairs) *
+                       (2.0 * seq_len * sizeof(uint8_t) + sizeof(int));
+    finalize_bandwidth(info, ms);
+    return ms;
+}
+
+static double run_smithwaterman_wavefront(cl::Context &ctx, cl::CommandQueue &q, cl::Program &prog,
+                                          const string &base, size_t config_idx,
+                                          bool &correct, RunInfo &info)
+{
+    string kname = base;
+    cl::Kernel krn(prog, kname.c_str());
+
+    const auto &spec = smithwaterman_problem_sizes().at(config_idx);
+    const size_t num_pairs = spec.num_pairs;
+    const int seq_len = static_cast<int>(spec.sequence_length);
+    const int match_score = 2;
+    const int mismatch_score = -1;
+    const int gap_score = -2;
+
+    std::vector<uint8_t> seqA;
+    std::vector<uint8_t> seqB;
+    std::vector<int> ref;
+    size_t verify_pairs = 0;
+    prepare_smithwaterman_data(num_pairs, seq_len, match_score, mismatch_score, gap_score, seqA, seqB, ref, verify_pairs);
+
+    cl::Buffer dA = make_read_buf(ctx, seqA);
+    cl::Buffer dB = make_read_buf(ctx, seqB);
+    cl::Buffer dOut = make_write_buf<int>(ctx, num_pairs);
+
+    krn.setArg(0, dA);
+    krn.setArg(1, dB);
+    krn.setArg(2, dOut);
+    krn.setArg(3, (int)num_pairs);
+    krn.setArg(4, seq_len);
+    krn.setArg(5, match_score);
+    krn.setArg(6, mismatch_score);
+    krn.setArg(7, gap_score);
+
+    size_t lws = static_cast<size_t>(seq_len);
+    size_t gws = lws * num_pairs;
+    cl::Event evt;
+    q.enqueueNDRangeKernel(krn, cl::NullRange, cl::NDRange(gws), cl::NDRange(lws), nullptr, &evt);
+    evt.wait();
+    double ms = event_elapsed_ms(evt);
+
+    std::vector<int> gpu(num_pairs);
+    read_back(q, dOut, gpu);
+    bool ok = true;
+    for (size_t i = 0; i < verify_pairs; ++i)
+    {
+        if (gpu[i] != ref[i])
+        {
+            ok = false;
+            break;
+        }
+    }
+    correct = ok;
+
+    set_runinfo_1d(info, gws, lws);
+    info.flops_est = double(num_pairs) * seq_len * seq_len * 6.0;
+    info.bytes_moved = double(num_pairs) *
+                       (2.0 * seq_len * sizeof(uint8_t) + sizeof(int));
+    finalize_bandwidth(info, ms);
+    return ms;
+}
+
+static double run_wfa(cl::Context &ctx, cl::CommandQueue &q, cl::Program &prog,
+                      const string &base, size_t config_idx,
+                      bool &correct, RunInfo &info)
+{
+    string kname = base;
+    cl::Kernel krn(prog, kname.c_str());
+
+    const auto &spec = wfa_problem_sizes().at(config_idx);
+    const size_t num_pairs = spec.num_pairs;
+    const int seq_len = static_cast<int>(spec.sequence_length);
+    size_t total_elems = num_pairs * static_cast<size_t>(seq_len);
+    std::vector<uint8_t> seqA(total_elems);
+    std::vector<uint8_t> seqB(total_elems);
+    fill_random_bases(seqA, 211);
+    fill_random_bases(seqB, 421);
+
+    std::vector<int> ref(num_pairs, std::numeric_limits<int>::min());
+    size_t verify_pairs = std::min<size_t>(num_pairs, 2048);
+    for (size_t p = 0; p < verify_pairs; ++p)
+    {
+        const uint8_t *a = seqA.data() + p * seq_len;
+        const uint8_t *b = seqB.data() + p * seq_len;
+        ref[p] = cpu_edit_distance_pair(a, b, seq_len);
+    }
+
+    cl::Buffer dA = make_read_buf(ctx, seqA);
+    cl::Buffer dB = make_read_buf(ctx, seqB);
+    cl::Buffer dOut = make_write_buf<int>(ctx, num_pairs);
+
+    krn.setArg(0, dA);
+    krn.setArg(1, dB);
+    krn.setArg(2, dOut);
+    krn.setArg(3, (int)num_pairs);
+    krn.setArg(4, seq_len);
+
+    size_t lws = 128;
+    size_t gws = round_up(num_pairs, lws);
+    cl::Event evt;
+    q.enqueueNDRangeKernel(krn, cl::NullRange, cl::NDRange(gws), cl::NDRange(lws), nullptr, &evt);
+    evt.wait();
+    double ms = event_elapsed_ms(evt);
+
+    std::vector<int> gpu(num_pairs);
+    read_back(q, dOut, gpu);
+    bool ok = true;
+    for (size_t i = 0; i < verify_pairs; ++i)
+    {
+        if (gpu[i] != ref[i])
+        {
+            ok = false;
+            break;
+        }
+    }
+    correct = ok;
+
+    set_runinfo_1d(info, gws, lws);
+    info.flops_est = double(num_pairs) * seq_len * seq_len * 4.0;
+    info.bytes_moved = double(num_pairs) *
+                       (2.0 * seq_len * sizeof(uint8_t) + sizeof(int));
     finalize_bandwidth(info, ms);
     return ms;
 }
@@ -1439,7 +1724,7 @@ struct ResultRow
 {
     std::string kernel;
     std::string dtype;
-    size_t size;
+    std::string size_label;
     double ms;
     bool correct;
     RunInfo info;
@@ -1466,7 +1751,7 @@ try
     }
 
     // 3) CSV path (header managed inside helper)
-    const std::string csv_path = "results_opencl.csv";
+    const std::string csv_path = "../csv/results_opencl.csv";
     std::remove(csv_path.c_str());
 
     // 4) Dispatch table per kernel name
@@ -1582,6 +1867,18 @@ try
         {
             ms = run_bitonic_u32(ctx, q, P, "sort_bitonic", sz, correct, info);
         }
+        else if (name == "smithwaterman_basic")
+        {
+            ms = run_smithwaterman(ctx, q, P, "smithwaterman_basic", sz, correct, info);
+        }
+        else if (name == "smithwaterman_wavefront")
+        {
+            ms = run_smithwaterman_wavefront(ctx, q, P, "smithwaterman_wavefront", sz, correct, info);
+        }
+        else if (name == "wfa_editdistance")
+        {
+            ms = run_wfa(ctx, q, P, "wfa_editdistance", sz, correct, info);
+        }
         else
         {
             correct = false;
@@ -1607,10 +1904,10 @@ try
                 ResultRow row32;
                 row32.kernel = b.name;
                 row32.dtype = "FP32";
-                row32.size = sz;
+                row32.size_label = size_label_for(b.name, sz);
                 cout << "[OpenCL] Running kernel=" << b.name << " dtype=FP32 size=" << sz << std::endl;
                 run_float(b.name, sz, /*want64*/ false, row32);
-                write_csv_row(csv_path, row32.kernel, row32.dtype, row32.size,
+                write_csv_row(csv_path, row32.kernel, row32.dtype, row32.size_label,
                               row32.ms, row32.correct, dev_name,
                               row32.info.gws0, row32.info.gws1, row32.info.gws2,
                               row32.info.lws0, row32.info.lws1, row32.info.lws2,
@@ -1621,10 +1918,10 @@ try
                     ResultRow row64;
                     row64.kernel = b.name;
                     row64.dtype = "FP64";
-                    row64.size = sz;
+                    row64.size_label = size_label_for(b.name, sz);
                     cout << "[OpenCL] Running kernel=" << b.name << " dtype=FP64 size=" << sz << std::endl;
                     run_float(b.name, sz, /*want64*/ true, row64);
-                    write_csv_row(csv_path, row64.kernel, row64.dtype, row64.size,
+                    write_csv_row(csv_path, row64.kernel, row64.dtype, row64.size_label,
                                   row64.ms, row64.correct, dev_name,
                                   row64.info.gws0, row64.info.gws1, row64.info.gws2,
                                   row64.info.lws0, row64.info.lws1, row64.info.lws2,
@@ -1635,11 +1932,11 @@ try
             { // INTEGER
                 ResultRow rowi;
                 rowi.kernel = b.name;
-                rowi.dtype = "INT";
-                rowi.size = sz;
+                rowi.dtype = "INT32";
+                rowi.size_label = size_label_for(b.name, sz);
                 cout << "[OpenCL] Running kernel=" << b.name << " dtype=INT size=" << sz << std::endl;
                 run_integer(b.name, sz, rowi);
-                write_csv_row(csv_path, rowi.kernel, rowi.dtype, rowi.size,
+                write_csv_row(csv_path, rowi.kernel, rowi.dtype, rowi.size_label,
                               rowi.ms, rowi.correct, dev_name,
                               rowi.info.gws0, rowi.info.gws1, rowi.info.gws2,
                               rowi.info.lws0, rowi.info.lws1, rowi.info.lws2,
@@ -1648,7 +1945,7 @@ try
         }
     }
 
-    cout << "Done. CSV written to results_opencl.csv" << std::endl;
+    cout << "Done. CSV written to " << csv_path << std::endl;
     return 0;
 }
 catch (const cl::Error &e)
